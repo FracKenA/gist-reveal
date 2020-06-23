@@ -13,6 +13,7 @@ var sanitizeHtml = require('sanitize-html');
 var rate_limit_slides = require('./rate_limit_response.json');
 var default_slides = require('./default_response.json');
 var error_slides = require('./error_response.json');
+var local_slide_resp = require('./local_slides.json');
 var sanitize = function(slideshow_content){
   return sanitizeHtml(slideshow_content, {
     allowedTags: sanitizeHtml.defaults.allowedTags.concat(['img','section','h1','h2','aside','span','hr','br','div','blockquote']),
@@ -62,17 +63,20 @@ var config = cc({
 , GH_CLIENT_SECRET : process.env.GH_CLIENT_SECRET
 , GA_TRACKER : process.env.GA_TRACKER
 , REVEAL_WEB_HOST : process.env.REVEAL_WEB_HOST || process.env.OPENSHIFT_APP_DNS || 'localhost:8080'
+, GIST_PATH : process.env.GIST_PATH || __dirname || '.'
+, GIST_FILENAME : process.env.GIST_FILENAME
 , TEMPLATE_LOGO_TEXT : process.env.TEMPLATE_LOGO_TEXT || "Runs on Kubernetes"
 , TEMPLATE_LOGO_IMG : process.env.TEMPLATE_LOGO_IMG || "/img/runsonk8s.svg"
 , TEMPLATE_LOGO_URL : process.env.TEMPLATE_LOGO_URL || "https://github.com/ryanj/gist-reveal#running-gist-revealit"
-, TEMPLATE_GIST_TEXT : process.env.TEMPLATE_GIST_TEXT || "Presentation Source"
-, TEMPLATE_GIST_IMG : process.env.TEMPLATE_GIST_IMG || "/img/presentation_source.svg"
+, TEMPLATE_GIST_TEXT : process.env.TEMPLATE_GIST_TEXT || "Presented by: @"
+, TEMPLATE_GIST_IMG : process.env.TEMPLATE_GIST_IMG || "/img/presented_by/"
 , TEMPLATE_GIST_URL : process.env.TEMPLATE_GIST_URL || "https://gist.github.com/"
 });
 var createHash = function(secret) {
 	var cipher = crypto.createCipher('blowfish', secret);
 	return(cipher.final('hex'));
 };
+var presented_by = fs.readFileSync(__dirname + '/img/presented_by.svg');
 var ga_tracker_html = function(tracker_id){
   if(typeof(tracker_id) !== 'undefined'){
     return "<script>(function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){\n" + 
@@ -107,8 +111,8 @@ var render_slideshow = function(gist, theme, cb) {
                            .replace(/\{\{template_logo_text}}/, config.get('TEMPLATE_LOGO_TEXT'))
                            .replace(/\{\{template_logo_img}}/, config.get('TEMPLATE_LOGO_IMG'))
                            .replace(/\{\{template_gist_url}}/, config.get('TEMPLATE_GIST_URL')+gist.id)
-                           .replace(/\{\{template_gist_text}}/, config.get('TEMPLATE_GIST_TEXT'))
-                           .replace(/\{\{template_gist_img}}/, config.get('TEMPLATE_GIST_IMG'))
+                           .replace(/\{\{template_gist_text}}/, config.get('TEMPLATE_GIST_TEXT')+user)
+                           .replace(/\{\{template_gist_img}}/, config.get('TEMPLATE_GIST_IMG')+user+'.svg')
                            .replace(/\{\{gist_id}}/, gist.id)
                            .replace(/\{\{user}}/, user)
                            .replace(/\{\{description}}/, description)
@@ -169,6 +173,17 @@ var get_theme = function(gist_id, cb) {
   })
 }
 
+var svgtemplate = function (req, res, next)
+{
+  var presenter_name = req.params.username || 'gist-reveal';
+  //var presented_by = fs.readFileSync(__dirname + '/img/presented_by.svg');
+  //console.log('button: {text: "'+presenter_name+'"}')
+  //console.log("request url:" + req.url)
+  res.status(200);
+  res.header('Content-Type', 'image/svg+xml');
+  res.end(presented_by.toString().replace(/gist-reveal/, "@"+presenter_name));
+};
+
 var concurrency = 0;
 
 var get_bitlink = function(req, res, next) {
@@ -214,13 +229,43 @@ var get_bitlink = function(req, res, next) {
   }
 };
 
+var get_local_slides = function(cb){
+  var path = config.get('GIST_PATH');
+  var filename = config.get('GIST_FILENAME');
+  var escaped=filename.replace(/\//g, "//").replace(/'/g, "\'").replace(/"/g, '\"'); 
+  var filejson = {};
+  filejson[escaped]={'type': "text/html"};
+  local_slide_resp.files=filejson;
+  
+  //look up local file, inject it into the template
+  fs.readFile(path+'/'+filename, function( error, local_content ){
+    if(error){
+      local_slide_resp.files[escaped].content="<section>"+error+"</section>"
+    }else{
+      local_slide_resp.files[escaped].content=local_content
+    }
+    cb(local_slide_resp)
+  })
+}
+
 var get_slides = function(req, res, next) {
+  var theme = req.query['theme'] || config.get('REVEAL_THEME');
   var gist_id = req.params.gist_id || req.query.gist_id || config.get('DEFAULT_GIST');
   if( !!bitly_gist_ids[gist_id] && req.path.indexOf('bit') == -1 ){
     //console.log("redirecting to: /bit.ly/" + bitly_gist_ids[gist_id]);
-    res.redirect("/bit.ly/"+bitly_gist_ids[gist_id]);
+    if( req.query['theme'] ){
+      res.redirect('/bit.ly/'+bitly_gist_ids[gist_id]+'?theme='+theme);
+    }else{
+      res.redirect("/bit.ly/"+bitly_gist_ids[gist_id]);
+    }
+  }else if( config.get('GIST_FILENAME')){
+    get_local_slides(function(gist){
+      render_slideshow(gist, theme, function(slides){
+        res.send(slides);
+        //return next();
+      });
+    });
   }else{
-    var theme = req.query['theme'] || config.get('REVEAL_THEME');
     get_gist(gist_id, function (error, response, api_response) {
       if (!error && response.statusCode == 200) {
         gist = JSON.parse(api_response);
@@ -305,6 +350,11 @@ app.get("/status", function(req,res,next) {
 
 // Static files:
 app.use(express.static(__dirname))
+
+// SVG templating
+app.get("/img/presented_by/:username\.svg", svgtemplate);
+app.get("/img/presented_by/:username.svg", svgtemplate);
+app.get("/img/presented_by/:username", svgtemplate);
 
 // Bit.ly shortname integration
 app.get("/bitly/:short_name", get_bitlink);
